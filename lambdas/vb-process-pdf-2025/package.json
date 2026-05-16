@@ -1,0 +1,17 @@
+{
+  "name": "vb-process-pdf-2025",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1002.0",
+    "@aws-sdk/client-textract": "^3.1002.0",
+    "@aws-sdk/lib-dynamodb": "^3.1002.0"
+  }
+}
