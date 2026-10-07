@@ -1,309 +1,305 @@
 # Vocabulary Builder MVP
 
-## Phase 2 — Asynchronous Document Processing with Amazon Textract
+## Phase 2 — Document Processing Architecture & Workflow
 
 **Status:** ✅ Completed  
 **AWS Region:** `us-east-1`
 
 ---
 
-## 1. Overview
+## 1. Phase 2 Overview
 
-Phase 2 adds asynchronous PDF text extraction to the Vocabulary Builder MVP.
+Phase 2 introduced the document-processing pipeline for the Vocabulary Builder MVP.
 
-The goal of this phase is to allow users to upload real learning materials as PDF documents and automatically convert them into machine-readable text.
+The primary objective was to transform user-uploaded PDF documents into extracted text that could later be processed by the AI layer.
 
-The extracted text becomes the foundation for later AI-powered features such as vocabulary extraction, exercise generation, difficulty classification, and personalization.
+```text
+PDF → Text → Ready for AI
+```
 
----
-
-## 2. Why Asynchronous Processing?
-
-PDF processing with Amazon Textract can take seconds or minutes.
-
-Instead of keeping a Lambda function running while waiting for Textract, the system separates job submission from result retrieval.
-
-The processing flow is:
-
-1. Submit the Textract job.
-2. Store the job state.
-3. Continue without waiting.
-4. Retrieve the result when processing is complete.
-5. Store the extracted text.
-
-This approach provides:
-
-- Better scalability
-- Reduced risk of Lambda timeouts
-- Clear document-state tracking
-- Easier retry and monitoring
-- Separation of responsibilities
+This phase uses an asynchronous, event-driven architecture with managed AWS services.
 
 ---
 
-## 3. Architecture
+## 2. Phase 2 Architecture
 
 ```mermaid
 flowchart TD
-
     U[User Uploads PDF]
-
-    S3[S3 Documents Bucket<br/>raw/userId/docId.pdf]
-
-    L1[Lambda #1<br/>SubmitTextractJob]
-
-    TX[Amazon Textract<br/>StartDocumentTextDetection]
-
-    DB1[DynamoDB<br/>Document State]
-
-    L2[Lambda #2<br/>PollTextractResult]
-
-    DB2[DynamoDB<br/>Extracted Text]
+    S3[Amazon S3<br/>raw/sub/docId.pdf]
+    L1[Lambda 1<br/>Submit Textract Job]
+    TX[Amazon Textract<br/>Asynchronous OCR]
+    SNS[Amazon SNS<br/>Completion Notification]
+    L2[Lambda 2<br/>Fetch Textract Results]
+    DB[Amazon DynamoDB<br/>Text + Document State]
+    AI[Ready for Phase 3 AI Processing]
 
     U --> S3
-    S3 -->|ObjectCreated Event| L1
-
+    S3 -->|ObjectCreated| L1
     L1 --> TX
-    L1 --> DB1
-
-    DB1 --> L2
+    L1 -->|TEXTRACT_SUBMITTED| DB
+    TX -->|Job Complete| SNS
+    SNS --> L2
     L2 -->|GetDocumentTextDetection| TX
-    L2 --> DB2
+    L2 -->|TEXTRACT_DONE + textractText| DB
+    DB --> AI
 ```
+
+The architecture separates job submission, document processing, completion notification, result retrieval, and state storage into independent components.
 
 ---
 
-## 4. PDF Upload
+## 3. Amazon S3
 
-Uploaded PDFs are stored in the private documents bucket created during Phase 1.
+Amazon S3 is the document storage layer.
 
-### S3 Path
+Bucket:
 
 ```text
-s3://vb-documents-2025/raw/<sub>/<docId>.pdf
+vb-documents-2025
 ```
 
-The path identifies:
+Document key:
 
-- The user (`sub`)
-- The document (`docId`)
+```text
+raw/<sub>/<docId>.pdf
+```
 
-An S3 `ObjectCreated` event starts the processing workflow.
+The `raw/` prefix contains newly uploaded documents entering the processing pipeline. An S3 `ObjectCreated` event invokes Lambda 1.
 
 ---
 
-## 5. Lambda #1 — SubmitTextractJob
+## 4. AWS Lambda — Lambda 1
 
-### Responsibility
+Lambda 1 starts the document-processing workflow.
 
-Submit the PDF to Amazon Textract and record the processing state.
+Responsibilities:
 
-### Trigger
+- Receive the S3 upload event.
+- Read and validate the S3 object key.
+- Extract the Cognito user identifier (`sub`).
+- Determine the document identifier (`docId`).
+- Submit an asynchronous Textract job using `StartDocumentTextDetection`.
+- Receive the Textract `JobId`.
+- Record the initial processing state in DynamoDB.
 
-```text
-S3 ObjectCreated
-```
-
-### Processing
-
-The Lambda function:
-
-1. Receives the S3 event.
-2. Validates the object key structure.
-3. Identifies the user and document.
-4. Calls:
+After submission:
 
 ```text
-StartDocumentTextDetection
-```
-
-5. Stores the Textract job metadata in DynamoDB.
-
-### Stored State
-
-```text
-textractJobId
 status = TEXTRACT_SUBMITTED
+```
+
+Lambda 1 does not wait for Textract to finish.
+
+---
+
+## 5. Amazon Textract
+
+Amazon Textract provides the OCR/document text extraction layer.
+
+```text
+Lambda 1
+  ↓
+StartDocumentTextDetection
+  ↓
+Textract JobId
+```
+
+Textract processes the PDF independently. This avoids keeping Lambda running while document processing is in progress.
+
+---
+
+## 6. Amazon SNS
+
+Amazon SNS provides the asynchronous notification layer between Textract and Lambda 2.
+
+```text
+Textract Processing
+  ↓
+Job Completed
+  ↓
+SNS Notification
+  ↓
+Lambda 2 Triggered
+```
+
+SNS eliminates the need to poll Textract continuously.
+
+---
+
+## 7. AWS Lambda — Lambda 2
+
+Lambda 2 retrieves completed Textract results after the SNS notification arrives.
+
+Responsibilities:
+
+- Receive the SNS event.
+- Parse the Textract completion message.
+- Read the Textract `JobId`.
+- Read `DocumentLocation.S3ObjectName` and derive `sub` and `docId` from the S3 key.
+- Call `GetDocumentTextDetection`.
+- Handle pagination using `NextToken`.
+- Process Textract blocks.
+- Select `LINE` blocks.
+- Combine extracted lines into plain text.
+- Store the text in DynamoDB as `textractText`.
+- Update the document state to `TEXTRACT_DONE`.
+
+The result is a complete plain-text representation of the uploaded PDF.
+
+---
+
+## 8. Amazon DynamoDB
+
+DynamoDB is the persistent state and document metadata store.
+
+Single-table key design:
+
+```text
+PK = USER#<sub>
+SK = PDF#<docId>
+```
+
+The document record can contain:
+
+```text
+status
+textractJobId
 s3Key
-timestamps
+updatedAt
+textractText
 ```
 
-### Design Reason
-
-This Lambda only submits the job.
-
-It does **not** wait for Textract to finish.
-
-This keeps the upload workflow fast and prevents unnecessary Lambda execution time.
+This allows document state to persist independently of individual Lambda executions.
 
 ---
 
-## 6. Lambda #2 — PollTextractResult
-
-### Responsibility
-
-Retrieve the completed Textract result and convert it into plain text.
-
-### Trigger
-
-During this phase, result retrieval was designed for:
+## 9. Document State Lifecycle
 
 ```text
-Manual / EventBridge
+TEXTRACT_SUBMITTED
+        ↓
+TEXTRACT_DONE
+        ↓
+EXERCISES_DONE
 ```
 
-with future orchestration improvements possible.
-
-### Processing
-
-The Lambda:
-
-1. Reads the Textract job ID.
-2. Calls:
+Phase 2 is responsible for reaching:
 
 ```text
-GetDocumentTextDetection
+TEXTRACT_DONE
 ```
 
-3. Handles Textract pagination using:
+At that point, the extracted text is ready for the AI-processing stage.
+
+---
+
+## 10. End-to-End Phase 2 Workflow
+
+1. **PDF Upload** — The PDF is stored at `s3://vb-documents-2025/raw/<sub>/<docId>.pdf`.
+2. **S3 Event** — S3 generates an `ObjectCreated` event and invokes Lambda 1.
+3. **Submit Textract Job** — Lambda 1 calls `StartDocumentTextDetection`, receives a `JobId`, stores it, and sets `TEXTRACT_SUBMITTED`.
+4. **Document Processing** — Textract processes the PDF asynchronously.
+5. **Completion Notification** — Textract publishes the completion notification to SNS.
+6. **Lambda 2 Invocation** — SNS invokes Lambda 2.
+7. **Retrieve Results** — Lambda 2 calls `GetDocumentTextDetection` and follows `NextToken` until all result pages are retrieved.
+8. **Build Plain Text** — Lambda 2 selects `BlockType = LINE` and joins the lines.
+9. **Store Result** — Lambda 2 writes `textractText` and sets `status = TEXTRACT_DONE`.
+
+---
+
+## 11. Architectural Design
+
+A major Phase 2 design decision was separating document submission from result retrieval.
+
+Instead of:
 
 ```text
-NextToken
+Upload → Lambda → Submit Textract → Wait → Fetch Result
 ```
 
-4. Extracts text from `LINE` blocks.
-5. Combines the extracted lines into plain text.
-6. Updates the document record in DynamoDB.
-
-### Final State
+the architecture uses:
 
 ```text
-status = TEXTRACT_DONE
-textractText = extracted document text
+Upload
+  ↓
+Lambda 1
+  ↓
+Textract
+  ↓
+SNS
+  ↓
+Lambda 2
+  ↓
+DynamoDB
 ```
 
----
-
-## 7. DynamoDB State Lifecycle
-
-Each document moves through explicit processing states.
-
-| Status | Meaning |
-|---|---|
-| `TEXTRACT_SUBMITTED` | Document was submitted to Textract |
-| `TEXTRACT_DONE` | Text extraction completed successfully |
-| `ERROR` | Processing failed and can be retried |
-
-This state-based design makes the workflow easier to:
-
-- Monitor
-- Debug
-- Retry
-- Extend in later phases
+This creates a loosely coupled, event-driven document-processing pipeline.
 
 ---
 
-## 8. Separation of Responsibilities
+## 12. Why the Architecture Is Asynchronous
 
-The processing logic is deliberately divided between two Lambda functions.
+Document processing is not guaranteed to complete immediately. Keeping a Lambda function running while waiting would unnecessarily couple Lambda execution time to Textract processing time.
 
-| Lambda | Responsibility |
-|---|---|
-| `SubmitTextractJob` | Submit the Textract job |
-| `PollTextractResult` | Retrieve and process the result |
-
-No single Lambda performs the entire workflow.
-
-This improves:
-
-- Scalability
-- Debugging
-- Reliability
-- Maintainability
-
----
-
-## 9. Security
-
-Both Lambda functions use scoped IAM permissions.
-
-### SubmitTextractJob
-
-Required permissions include:
+The asynchronous pattern is:
 
 ```text
-textract:StartDocumentTextDetection
-s3:GetObject
-dynamodb:UpdateItem
+Submit → Exit → Process → Notify → Continue
 ```
 
-### PollTextractResult
+Each AWS service performs its responsibility independently, providing a foundation for later event-driven processing stages.
 
-Required permissions include:
+---
+
+## 13. Phase 2 Result
+
+At the completion of Phase 2, Vocabulary Builder can:
+
+- Receive PDF documents.
+- Store them securely in Amazon S3.
+- Automatically start document processing.
+- Extract text with Amazon Textract.
+- Receive asynchronous completion notifications through SNS.
+- Retrieve multi-page Textract results.
+- Convert Textract blocks into plain text.
+- Persist document state in DynamoDB.
+- Store `textractText` for downstream processing.
+
+Final output:
 
 ```text
-textract:GetDocumentTextDetection
-dynamodb:GetItem
-dynamodb:UpdateItem
+Uploaded PDF
+     ↓
+Extracted Text
+     ↓
+Stored Application State
+     ↓
+Ready for AI
 ```
 
-The architecture continues the private-by-default security model established in Phase 1.
-
-- No public document access
-- Private S3 storage
-- IAM-controlled service access
-- Least-privilege permissions
-
 ---
 
-## 10. Error Handling & Reliability
+## 14. Transition to Phase 3
 
-Phase 2 introduces several reliability mechanisms:
+Phase 2 ends when the document reaches:
 
-- Invalid files are rejected early.
-- Textract failures can be recorded in the document state.
-- DynamoDB state prevents uncontrolled processing.
-- Failed jobs can be retried.
-- Textract pagination is handled using `NextToken`.
+```text
+TEXTRACT_DONE
+```
 
----
-
-## 11. Phase 2 Result
-
-At the end of Phase 2, the Vocabulary Builder can:
-
-- ✅ Accept uploaded PDF learning materials.
-- ✅ Start asynchronous Textract jobs.
-- ✅ Track document-processing state.
-- ✅ Retrieve multi-page Textract results.
-- ✅ Convert Textract `LINE` blocks into plain text.
-- ✅ Store extracted text in DynamoDB.
-- ✅ Produce machine-readable content for later AI processing.
-
----
-
-## 12. Phase 2 Scope
-
-Phase 2 focuses specifically on **document-to-text processing**.
-
-The output of this phase is:
+Phase 3 consumes `textractText` and extends the pipeline into AI exercise generation.
 
 ```text
 PDF
  ↓
-Amazon Textract
+Textract
  ↓
 Extracted Text
  ↓
-DynamoDB
+AI Processing
+ ↓
+Generated Exercises
 ```
 
-AI exercise generation and other learning features are handled in later phases.
-
----
-
-## Status
-
 **Phase 2: COMPLETE ✅**
-
-The project now has an asynchronous document-processing foundation ready for the next stage of the Vocabulary Builder pipeline.
